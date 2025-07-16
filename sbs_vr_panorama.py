@@ -13,7 +13,6 @@ class SBS_VR_Panorama_by_SamSeen:
     
     def __init__(self):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        # Import your existing depth model
         try:
             from depth_estimator import DepthEstimator
             self.depth_model = DepthEstimator()
@@ -24,15 +23,14 @@ class SBS_VR_Panorama_by_SamSeen:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "panorama_image": ("IMAGE",),
-                "depth_scale": ("FLOAT", {"default": 15.0, "min": 1.0, "max": 50.0, "step": 0.5}),
-                "blur_radius": ("INT", {"default": 5, "min": 1, "max": 31, "step": 2}),
-                "segment_overlap": ("FLOAT", {"default": 0.1, "min": 0.05, "max": 0.3, "step": 0.05}),
-                "ipd_mm": ("FLOAT", {"default": 65.0, "min": 50.0, "max": 80.0, "step": 1.0}),
-                "format": (["side_by_side", "over_under"], {"default": "over_under"}),
-                "invert_depth": ("BOOLEAN", {"default": False}),
-                "depth_quality": (["standard", "high", "ultra"], {"default": "high"}),
-                "edge_enhancement": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.1}),
+                "panorama_image": ("IMAGE", {"tooltip": "Input 360° panoramic image in equirectangular format (2:1 aspect ratio)"}),
+                "depth_scale": ("FLOAT", {"default": 15.0, "min": 1.0, "max": 50.0, "step": 0.5, "tooltip": "Controls the intensity of the 3D stereo effect. Higher values = more dramatic depth, but may cause eye strain in VR. Recommended: 10-20 for VR comfort."}),
+                "blur_radius": ("INT", {"default": 5, "min": 1, "max": 31, "step": 2, "tooltip": "Smooths depth transitions for comfortable VR viewing. Higher values = smoother but less detailed depth. Odd numbers only. Recommended: 3-7."}),
+                "ipd_mm": ("FLOAT", {"default": 65.0, "min": 50.0, "max": 80.0, "step": 1.0, "tooltip": "Interpupillary distance (distance between your eyes) in millimeters. Affects stereo separation. Average adult: 62-68mm. Adjust if VR feels uncomfortable."}),
+                "format": (["side_by_side", "over_under"], {"default": "over_under", "tooltip": "VR output format. Over-under works best with Quest 3/Meta headsets. Side-by-side for general VR compatibility."}),
+                "invert_depth": ("BOOLEAN", {"default": False, "tooltip": "Reverses depth perception (swap foreground/background). Enable if depth appears backwards in VR."}),
+                "depth_quality": (["standard", "high", "ultra"], {"default": "high", "tooltip": "Depth processing quality. Standard=fast, High=balanced, Ultra=best quality with advanced enhancements. Ultra may be slower."}),
+                "edge_enhancement": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.1, "tooltip": "Enhances fine depth details using unsharp masking. 0=off, 0.2-0.4=recommended, 1.0=maximum enhancement. Higher values may introduce artifacts."}),
             }
         }
 
@@ -83,8 +81,6 @@ class SBS_VR_Panorama_by_SamSeen:
 
     def perspective_to_equirectangular(self, perspective_img, theta, phi, eq_width, eq_height, fov=90):
         """Convert perspective view back to equirectangular coordinates"""
-        # This is a simplified back-projection
-        # In practice, you'd need more sophisticated blending
         return perspective_img
 
     def enhance_depth_quality(self, depth_map, quality_level="high", edge_enhancement=0.0):
@@ -98,7 +94,7 @@ class SBS_VR_Panorama_by_SamSeen:
         # High quality enhancements
         if quality_level in ["high", "ultra"]:
             
-            # 1. Edge enhancement using unsharp masking
+            # Edge enhancement using unsharp masking
             if edge_enhancement > 0.0:
                 # Create a blurred version
                 blurred = cv2.GaussianBlur(enhanced_depth, (5, 5), 0)
@@ -109,13 +105,11 @@ class SBS_VR_Panorama_by_SamSeen:
                 # Clamp to valid range
                 enhanced_depth = np.clip(enhanced_depth, 0.0, 1.0)
                 print(f"Applied edge enhancement: {edge_enhancement}")
-            
-            # 2. Contrast enhancement
+
             # Increase contrast while preserving detail
             mean_depth = np.mean(enhanced_depth)
             enhanced_depth = np.clip((enhanced_depth - mean_depth) * 1.2 + mean_depth, 0.0, 1.0)
             
-            # 3. Detail preservation filter
             # Bilateral filter to smooth while preserving edges
             enhanced_depth_8bit = (enhanced_depth * 255).astype(np.uint8)
             filtered = cv2.bilateralFilter(enhanced_depth_8bit, 9, 75, 75)
@@ -124,7 +118,6 @@ class SBS_VR_Panorama_by_SamSeen:
         # Ultra quality additional enhancements
         if quality_level == "ultra":
             
-            # 4. Multi-scale depth refinement
             # Process at multiple scales and combine
             h, w = enhanced_depth.shape
             
@@ -161,10 +154,10 @@ class SBS_VR_Panorama_by_SamSeen:
                 return np.ones((h, w), dtype=np.float32) * 0.5
 
         try:
-            # Set the blur radius exactly like SBS V2
+            # Set the blur radius
             self.depth_model.blur_radius = blur_radius
             
-            # Process as tensor like SBS V2 does - convert to numpy the same way
+            # Process as tensor like SBS V2 - convert to numpy 
             panorama_np = panorama_tensor.cpu().numpy() * 255.0
             panorama_np = panorama_np.astype(np.uint8)
             
@@ -264,7 +257,7 @@ class SBS_VR_Panorama_by_SamSeen:
         
         return shifted_image
 
-    def create_vr_panorama(self, panorama_image, depth_scale, blur_radius, segment_overlap, ipd_mm, format, invert_depth, depth_quality="high", edge_enhancement=0.0):
+    def create_vr_panorama(self, panorama_image, depth_scale, blur_radius, ipd_mm, format, invert_depth, depth_quality="high", edge_enhancement=0.0):
         """Create VR-compatible stereoscopic panorama"""
         
         # Handle batch dimension properly - but keep as tensor for depth processing
@@ -277,7 +270,7 @@ class SBS_VR_Panorama_by_SamSeen:
         
         print(f"Processing panorama tensor: {panorama_tensor.shape}")
         
-        # Generate depth map using exact SBS V2 approach with quality enhancements
+        # Generate depth map using SBS V2 approach with quality enhancements
         print(f"Generating panoramic depth map using exact SBS V2 approach with {depth_quality} quality...")
         depth_map = self.generate_panorama_depth(panorama_tensor[0], blur_radius, depth_quality)
         
@@ -297,7 +290,6 @@ class SBS_VR_Panorama_by_SamSeen:
             depth_map = cv2.GaussianBlur(depth_map, (blur_radius, blur_radius), 0)
             print(f"Applied Gaussian blur with radius {blur_radius}")
         
-        # Apply depth inversion if requested
         if invert_depth:
             print("Applying user-requested depth inversion")
             depth_map = 1.0 - depth_map
@@ -330,7 +322,7 @@ class SBS_VR_Panorama_by_SamSeen:
         # Convert back to tensors
         stereo_tensor = torch.tensor(stereo_panorama.astype(np.float32) / 255.0).unsqueeze(0)
         
-        # Create depth visualization (now correctly oriented)
+        # Create depth visualization
         depth_vis = np.stack([depth_map, depth_map, depth_map], axis=-1)
         depth_tensor = torch.tensor(depth_vis).unsqueeze(0)
         
