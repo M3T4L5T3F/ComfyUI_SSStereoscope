@@ -5,31 +5,34 @@ from PIL import Image
 import math
 from comfy.utils import ProgressBar
 import gc
-from typing import Tuple, Optional
+from typing import Tuple
+import os
+import sys
+
+# Add the current directory to the path for depth estimator import
+current_dir = os.path.dirname(os.path.abspath(__file__))
+if current_dir not in sys.path:
+    sys.path.append(current_dir)
 
 class SBS_VR_Panorama_by_SamSeen:
     """
-    Create VR-compatible stereoscopic 360-degree panoramas from equirectangular images.
-    Generates depth-aware panoramic content for VR headsets and 360 video players.
+    Create high-quality VR-compatible stereoscopic 360° panoramas from equirectangular images.
+    Simplified version focused on quality over complexity.
     """
     
     def __init__(self):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.depth_model = None
-        self._depth_cache = {}
-        
-        # Pre-computed constants for optimization
-        self._pi = math.pi
-        self._two_pi = 2 * math.pi
         
     def _load_depth_model(self):
-        """Lazy load depth model to save memory"""
+        """Load depth estimation model"""
         if self.depth_model is None:
             try:
                 from depth_estimator import DepthEstimator
                 self.depth_model = DepthEstimator()
                 self.depth_model.load_model()
                 print("Loaded depth model for VR panorama processing")
+                return True
             except Exception as e:
                 print(f"Warning: Could not load depth model: {e}")
                 return False
@@ -40,15 +43,10 @@ class SBS_VR_Panorama_by_SamSeen:
         return {
             "required": {
                 "panorama_image": ("IMAGE", {"tooltip": "Input 360° panoramic image in equirectangular format (2:1 aspect ratio)"}),
-                "depth_scale": ("FLOAT", {"default": 15.0, "min": 1.0, "max": 50.0, "step": 0.5, "tooltip": "Controls the intensity of the 3D stereo effect. Higher values = more dramatic depth, but may cause eye strain in VR. Recommended: 10-20 for VR comfort."}),
-                "blur_radius": ("INT", {"default": 5, "min": 1, "max": 31, "step": 2, "tooltip": "Smooths depth transitions for comfortable VR viewing. Higher values = smoother but less detailed depth. Odd numbers only. Recommended: 3-7."}),
-                "ipd_mm": ("FLOAT", {"default": 65.0, "min": 50.0, "max": 80.0, "step": 1.0, "tooltip": "Interpupillary distance (distance between your eyes) in millimeters. Affects stereo separation. Average adult: 62-68mm. Adjust if VR feels uncomfortable."}),
-                "format": (["side_by_side", "over_under"], {"default": "over_under", "tooltip": "VR output format. Over-under works best with Quest 3/Meta headsets. Side-by-side for general VR compatibility."}),
-                "invert_depth": ("BOOLEAN", {"default": False, "tooltip": "Reverses depth perception (swap foreground/background). Enable if depth appears backwards in VR."}),
-                "depth_quality": (["standard", "high", "ultra"], {"default": "high", "tooltip": "Depth processing quality. Standard=fast, High=balanced, Ultra=best quality with advanced enhancements. Ultra may be slower."}),
-                "edge_enhancement": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.1, "tooltip": "Enhances fine depth details using unsharp masking. 0=off, 0.2-0.4=recommended, 1.0=maximum enhancement. Higher values may introduce artifacts."}),
-                "depth_consistency": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.1, "tooltip": "Spatial consistency for panoramic depth. 0=off, 0.3=balanced, 1.0=maximum smoothing. Ensures seamless 360° wrapping and smooth depth transitions. Higher values create more uniform depth flow."}),
-                "memory_optimization": ("BOOLEAN", {"default": True, "tooltip": "Enable memory optimization for large panoramas. Recommended for 4K+ images."}),
+                "depth_scale": ("FLOAT", {"default": 10.0, "min": 1.0, "max": 20.0, "step": 0.5, "tooltip": "Controls stereo separation intensity. Start at 10 for noticeable depth, reduce if uncomfortable in VR."}),
+                "ipd_mm": ("FLOAT", {"default": 65.0, "min": 50.0, "max": 80.0, "step": 1.0, "tooltip": "Interpupillary distance in millimeters. Average adult: 62-68mm."}),
+                "format": (["over_under", "side_by_side"], {"default": "over_under", "tooltip": "VR output format. Over-under recommended for Quest/Meta headsets."}),
+                "invert_depth": ("BOOLEAN", {"default": True, "tooltip": "Reverse depth perception. Usually needed since depth models often produce inverted depth."}),
             }
         }
 
@@ -56,252 +54,17 @@ class SBS_VR_Panorama_by_SamSeen:
     RETURN_NAMES = ("vr_panorama", "depth_panorama")
     FUNCTION = "create_vr_panorama"
     CATEGORY = "👀 SamSeen"
-    DESCRIPTION = "Create VR-compatible stereoscopic 360° panoramas with automatic depth generation for immersive VR experiences"
+    DESCRIPTION = "Create high-quality VR-compatible stereoscopic 360° panoramas with optimized depth processing"
 
-    def _compute_optimal_tile_size(self, width: int, height: int, max_memory_mb: int = 2048) -> Tuple[int, int]:
-        """Compute optimal tile size for memory-efficient processing"""
-        # Estimate memory usage per pixel (RGB + depth + intermediate calculations)
-        bytes_per_pixel = 4 * 3 + 4 + 4 * 2  # ~20 bytes per pixel
-        max_pixels = (max_memory_mb * 1024 * 1024) // bytes_per_pixel
-        
-        if width * height <= max_pixels:
-            return width, height
-            
-        # Calculate tile dimensions maintaining aspect ratio
-        aspect_ratio = width / height
-        tile_height = int(math.sqrt(max_pixels / aspect_ratio))
-        tile_width = int(tile_height * aspect_ratio)
-        
-        # Ensure tiles are divisible by 14 (patch size for ViT)
-        tile_width = (tile_width // 14) * 14
-        tile_height = (tile_height // 14) * 14
-        
-        return max(tile_width, 14), max(tile_height, 14)
-
-    def _process_panorama_tiles(self, panorama_np: np.ndarray, tile_width: int, tile_height: int, 
-                               overlap: int = 56) -> np.ndarray:
-        """Process panorama in tiles with overlap for seamless depth generation"""
-        height, width = panorama_np.shape[:2]
-        depth_map = np.zeros((height, width), dtype=np.float32)
-        weight_map = np.zeros((height, width), dtype=np.float32)
-        
-        # Calculate number of tiles
-        num_tiles_x = math.ceil(width / (tile_width - overlap))
-        num_tiles_y = math.ceil(height / (tile_height - overlap))
-        
-        print(f"Processing {num_tiles_x}x{num_tiles_y} tiles of size {tile_width}x{tile_height}")
-        
-        for ty in range(num_tiles_y):
-            for tx in range(num_tiles_x):
-                # Calculate tile boundaries
-                start_x = tx * (tile_width - overlap)
-                start_y = ty * (tile_height - overlap)
-                end_x = min(start_x + tile_width, width)
-                end_y = min(start_y + tile_height, height)
-                
-                # Extract tile with padding if at edges
-                tile = panorama_np[start_y:end_y, start_x:end_x]
-                
-                # Pad tile to required size if needed
-                if tile.shape[0] < tile_height or tile.shape[1] < tile_width:
-                    padded_tile = np.zeros((tile_height, tile_width, 3), dtype=panorama_np.dtype)
-                    padded_tile[:tile.shape[0], :tile.shape[1]] = tile
-                    tile = padded_tile
-                
-                # Process tile
-                try:
-                    tile_depth = self.depth_model.predict_depth(tile)
-                    tile_depth = tile_depth[:end_y-start_y, :end_x-start_x]  # Remove padding
-                except Exception as e:
-                    print(f"Error processing tile ({tx}, {ty}): {e}")
-                    tile_depth = np.ones((end_y-start_y, end_x-start_x), dtype=np.float32) * 0.5
-                
-                # Create weight map for blending (higher weights in center)
-                tile_weights = np.ones((end_y-start_y, end_x-start_x), dtype=np.float32)
-                if overlap > 0:
-                    # Apply cosine weighting for smooth blending
-                    for i in range(tile_weights.shape[0]):
-                        for j in range(tile_weights.shape[1]):
-                            weight_x = 1.0
-                            weight_y = 1.0
-                            
-                            if start_x > 0 and j < overlap // 2:
-                                weight_x = 0.5 * (1 + math.cos(math.pi * (overlap // 2 - j) / (overlap // 2)))
-                            elif end_x < width and j >= tile_weights.shape[1] - overlap // 2:
-                                weight_x = 0.5 * (1 + math.cos(math.pi * (j - (tile_weights.shape[1] - overlap // 2)) / (overlap // 2)))
-                                
-                            if start_y > 0 and i < overlap // 2:
-                                weight_y = 0.5 * (1 + math.cos(math.pi * (overlap // 2 - i) / (overlap // 2)))
-                            elif end_y < height and i >= tile_weights.shape[0] - overlap // 2:
-                                weight_y = 0.5 * (1 + math.cos(math.pi * (i - (tile_weights.shape[0] - overlap // 2)) / (overlap // 2)))
-                            
-                            tile_weights[i, j] = weight_x * weight_y
-                
-                # Accumulate depth and weights
-                depth_map[start_y:end_y, start_x:end_x] += tile_depth * tile_weights
-                weight_map[start_y:end_y, start_x:end_x] += tile_weights
-                
-                # Clean up to save memory
-                del tile_depth, tile_weights
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-        
-        # Normalize by weights
-        valid_mask = weight_map > 0
-        depth_map[valid_mask] /= weight_map[valid_mask]
-        
-        # Fill any remaining zero areas
-        if not np.all(valid_mask):
-            print("Warning: Some areas not covered by tiles, filling with interpolation")
-            from scipy.interpolate import griddata
-            valid_points = np.column_stack(np.where(valid_mask))
-            valid_values = depth_map[valid_mask]
-            invalid_points = np.column_stack(np.where(~valid_mask))
-            
-            if len(valid_points) > 3 and len(invalid_points) > 0:
-                interpolated = griddata(valid_points, valid_values, invalid_points, method='linear', fill_value=0.5)
-                depth_map[~valid_mask] = interpolated
-        
-        return depth_map
-
-    def _enhance_panoramic_depth(self, depth_map: np.ndarray, quality_level: str = "high", 
-                                edge_enhancement: float = 0.0, consistency: float = 0.3) -> np.ndarray:
-        """Enhanced depth processing specifically optimized for panoramic content"""
-        
-        enhanced_depth = depth_map.copy()
-        h, w = enhanced_depth.shape
-        
-        # Apply depth consistency processing with careful intensity control
-        if consistency > 0.0:
-            # Circular continuity enforcement for 360° wrapping (horizontal)
-            # Only blend at the edges - don't affect the rest of the image
-            edge_width = min(w // 30, 32)  # Smaller edge width to reduce impact
-            if edge_width > 0:
-                left_edge = enhanced_depth[:, :edge_width]
-                right_edge = enhanced_depth[:, -edge_width:]
-                
-                # Blend edges for seamless wrapping with reduced intensity
-                for i in range(edge_width):
-                    # Reduce the consistency effect to preserve original depth quality
-                    weight = (i + 1) / edge_width * consistency * 0.5  # Reduced from full consistency
-                    blended_left = (1 - weight) * left_edge[:, i] + weight * right_edge[:, -(i+1)]
-                    blended_right = (1 - weight) * right_edge[:, -(i+1)] + weight * left_edge[:, i]
-                    
-                    enhanced_depth[:, i] = blended_left
-                    enhanced_depth[:, -(i+1)] = blended_right
-            
-            # Add gentle vertical smoothing for higher consistency values
-            if consistency > 0.5:  # Increase threshold to make it less aggressive
-                kernel_size = max(3, int(3 * consistency))  # Smaller kernel sizes
-                if kernel_size % 2 == 0:
-                    kernel_size += 1
-                
-                # Apply very light vertical blur
-                smoothed_vertical = cv2.GaussianBlur(enhanced_depth, (1, kernel_size), 0)
-                # Blend with original with much lower intensity
-                blend_factor = consistency * 0.2  # Much lower blend factor
-                enhanced_depth = (1 - blend_factor) * enhanced_depth + blend_factor * smoothed_vertical
-            
-            # Add subtle radial consistency for higher consistency values
-            if consistency > 0.7: 
-                # Create radial weight map
-                center_y, center_x = h // 2, w // 2
-                y_coords, x_coords = np.ogrid[:h, :w]
-                
-                # Calculate distance from center (normalized)
-                distances = np.sqrt(((y_coords - center_y) / h)**2 + ((x_coords - center_x) / w)**2)
-                distances = distances / np.max(distances)  # Normalize to 0-1
-                
-                # Apply very subtle radial adjustment
-                radial_adjustment = 1.0 - (distances * (consistency - 0.7) * 0.1) 
-                radial_adjustment = np.clip(radial_adjustment, 0.9, 1.1)  # Limit the adjustment range
-                
-                # Apply subtle radial consistency
-                enhanced_depth *= radial_adjustment
-        
-        # Early return for standard quality 
-        if quality_level == "standard":
-            # Ensure depth values are still in valid range
-            enhanced_depth = np.clip(enhanced_depth, 0.0, 1.0)
-            return enhanced_depth
-        
-        # Panoramic pole correction - reduce distortion at top/bottom
-        if quality_level in ["high", "ultra"]:
-            pole_correction_strength = 0.2  
-            for y in range(h):
-                # Calculate distance from equator (0.5)
-                lat_norm = abs(y / h - 0.5) * 2  # 0 at equator, 1 at poles
-                if lat_norm > 0.8:  # Only correct very close to poles
-                    correction_factor = 1.0 - (lat_norm - 0.8) * pole_correction_strength
-                    enhanced_depth[y, :] *= correction_factor
-        
-        # Edge enhancement with panoramic awareness
-        if edge_enhancement > 0.0:
-            # Use adaptive kernel size based on image resolution
-            kernel_size = max(3, min(11, w // 512))  
-            if kernel_size % 2 == 0:
-                kernel_size += 1
-            
-            # Create latitude-weighted enhancement
-            blurred = cv2.GaussianBlur(enhanced_depth, (kernel_size, kernel_size), 0)
-            edge_mask = enhanced_depth - blurred
-            
-            # Apply latitude weighting (stronger enhancement at equator)
-            lat_weights = np.zeros(h)
-            for y in range(h):
-                lat_norm = abs(y / h - 0.5) * 2
-                lat_weights[y] = 1.0 - lat_norm * 0.3 
-            
-            for y in range(h):
-                enhanced_depth[y, :] += edge_mask[y, :] * edge_enhancement * lat_weights[y]
-            
-            enhanced_depth = np.clip(enhanced_depth, 0.0, 1.0)
-        
-        if quality_level == "ultra":
-            scales = [1.0, 0.5]  
-            scale_weights = [0.8, 0.2]  
-            refined_depth = np.zeros_like(enhanced_depth)
-            
-            for scale, weight in zip(scales, scale_weights):
-                if scale == 1.0:
-                    scale_depth = enhanced_depth
-                else:
-                    scale_w, scale_h = int(w * scale), int(h * scale)
-                    scale_depth = cv2.resize(enhanced_depth, (scale_w, scale_h), interpolation=cv2.INTER_AREA)
-                    
-                    # Apply gentler bilateral filter
-                    scale_depth_8bit = (scale_depth * 255).astype(np.uint8)
-                    filtered = cv2.bilateralFilter(scale_depth_8bit, 5, 50, 50)  
-                    scale_depth = filtered.astype(np.float32) / 255.0
-                    
-                    # Resize back to original size
-                    scale_depth = cv2.resize(scale_depth, (w, h), interpolation=cv2.INTER_CUBIC)
-                
-                refined_depth += scale_depth * weight
-            
-            enhanced_depth = refined_depth
-        
-        mean_depth = np.mean(enhanced_depth)
-        contrast_factor = 1.05  # Reduced from 1.1 to preserve detail
-        enhanced_depth = np.clip((enhanced_depth - mean_depth) * contrast_factor + mean_depth, 0.0, 1.0)
-        
-        print(f"Depth enhancement complete: quality={quality_level}, edge={edge_enhancement}, consistency={consistency}")
-        
-        return enhanced_depth
-
-    def _generate_panorama_depth(self, panorama_tensor: torch.Tensor, blur_radius: int, 
-                               quality_level: str = "high", memory_optimization: bool = True) -> np.ndarray:
-        """Generate depth map with memory optimization for large panoramas"""
+    def _generate_panorama_depth(self, panorama_tensor: torch.Tensor) -> np.ndarray:
+        """Generate high-quality depth map optimized for panoramic content"""
         
         if not self._load_depth_model():
             h, w = panorama_tensor.shape[1:3]
-            print("Using fallback depth map")
-            return self._create_fallback_depth(h, w)
+            print("Using gradient fallback depth map")
+            return self._create_gradient_depth(h, w)
         
         try:
-            # Set blur radius
-            self.depth_model.blur_radius = blur_radius
-            
             # Convert to numpy
             panorama_np = panorama_tensor.cpu().numpy() * 255.0
             panorama_np = panorama_np.astype(np.uint8)
@@ -309,28 +72,142 @@ class SBS_VR_Panorama_by_SamSeen:
             original_h, original_w = panorama_np.shape[:2]
             print(f"Processing panorama: {original_w}x{original_h}")
             
-            # Memory optimization: process in tiles for large images
-            if memory_optimization and (original_w > 4096 or original_h > 2048):
-                tile_w, tile_h = self._compute_optimal_tile_size(original_w, original_h)
-                print(f"Using tiled processing: {tile_w}x{tile_h} tiles")
-                depth_map = self._process_panorama_tiles(panorama_np, tile_w, tile_h)
+            # For large images, process in tiles for memory efficiency
+            if original_w > 4096 or original_h > 2048:
+                depth_map = self._process_panorama_tiles(panorama_np)
             else:
                 # Process entire image
                 depth_map = self.depth_model.predict_depth(panorama_np)
             
-            # Normalize depth map
-            if np.min(depth_map) < 0 or np.max(depth_map) > 1:
-                depth_map = cv2.normalize(depth_map, None, 0, 1, cv2.NORM_MINMAX)
+            # Apply panorama-specific depth enhancements
+            depth_map = self._enhance_panorama_depth(depth_map, original_w, original_h)
             
             return depth_map
             
         except Exception as e:
             print(f"Error generating depth map: {e}")
-            return self._create_fallback_depth(panorama_tensor.shape[1], panorama_tensor.shape[2])
+            return self._create_gradient_depth(panorama_tensor.shape[1], panorama_tensor.shape[2])
 
-    def _create_fallback_depth(self, height: int, width: int) -> np.ndarray:
-        """Create a reasonable fallback depth map for panoramas"""
-        # Create depth based on distance from center with some variation
+    def _process_panorama_tiles(self, panorama_np: np.ndarray, tile_size: int = 1024, overlap: int = 128) -> np.ndarray:
+        """Process large panoramas in overlapping tiles"""
+        height, width = panorama_np.shape[:2]
+        depth_map = np.zeros((height, width), dtype=np.float32)
+        weight_map = np.zeros((height, width), dtype=np.float32)
+        
+        # Calculate number of tiles
+        num_tiles_x = math.ceil(width / (tile_size - overlap))
+        num_tiles_y = math.ceil(height / (tile_size - overlap))
+        
+        print(f"Processing {num_tiles_x}x{num_tiles_y} tiles")
+        
+        for ty in range(num_tiles_y):
+            for tx in range(num_tiles_x):
+                # Calculate tile boundaries
+                start_x = tx * (tile_size - overlap)
+                start_y = ty * (tile_size - overlap)
+                end_x = min(start_x + tile_size, width)
+                end_y = min(start_y + tile_size, height)
+                
+                # Extract tile
+                tile = panorama_np[start_y:end_y, start_x:end_x]
+                
+                # Process tile
+                try:
+                    tile_depth = self.depth_model.predict_depth(tile)
+                except Exception as e:
+                    print(f"Error processing tile ({tx}, {ty}): {e}")
+                    tile_depth = np.ones((end_y-start_y, end_x-start_x), dtype=np.float32) * 0.5
+                
+                # Create weight map for blending (cosine weighting)
+                tile_h, tile_w = tile_depth.shape
+                weights = np.ones((tile_h, tile_w), dtype=np.float32)
+                
+                # Apply edge feathering for seamless blending
+                if overlap > 0:
+                    feather = overlap // 4
+                    for i in range(tile_h):
+                        for j in range(tile_w):
+                            # Distance to edges
+                            dist_left = j
+                            dist_right = tile_w - j - 1
+                            dist_top = i
+                            dist_bottom = tile_h - i - 1
+                            
+                            # Apply feathering
+                            if start_x > 0 and dist_left < feather:
+                                weights[i, j] *= dist_left / feather
+                            if end_x < width and dist_right < feather:
+                                weights[i, j] *= dist_right / feather
+                            if start_y > 0 and dist_top < feather:
+                                weights[i, j] *= dist_top / feather
+                            if end_y < height and dist_bottom < feather:
+                                weights[i, j] *= dist_bottom / feather
+                
+                # Accumulate depth and weights
+                depth_map[start_y:end_y, start_x:end_x] += tile_depth * weights
+                weight_map[start_y:end_y, start_x:end_x] += weights
+                
+                # Memory cleanup
+                del tile_depth, weights
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+        
+        # Normalize by weights
+        valid_mask = weight_map > 0.01
+        depth_map[valid_mask] /= weight_map[valid_mask]
+        
+        return depth_map
+
+    def _enhance_panorama_depth(self, depth_map: np.ndarray, width: int, height: int) -> np.ndarray:
+        """Apply panorama-specific depth enhancements optimized for realistic VR depth"""
+        
+        # Normalize depth to [0,1]
+        depth_min, depth_max = np.min(depth_map), np.max(depth_map)
+        if depth_max - depth_min > 1e-6:
+            depth_map = (depth_map - depth_min) / (depth_max - depth_min)
+        
+        # Lighter filtering to preserve resolution and detail
+        depth_8bit = (depth_map * 255).astype(np.uint8)
+        # Single bilateral filter pass - preserve more detail
+        filtered = cv2.bilateralFilter(depth_8bit, 5, 50, 50)
+        depth_map = filtered.astype(np.float32) / 255.0
+        
+        # Much lighter gaussian blur to preserve sharpness
+        blur_size = max(3, min(5, width // 1000))  # Smaller blur relative to size
+        if blur_size % 2 == 0:
+            blur_size += 1
+        depth_map = cv2.GaussianBlur(depth_map, (blur_size, blur_size), 0)
+        
+        # Improve depth realism with better curve
+        # Instead of power 0.7, use a more realistic depth curve
+        # This creates more gradual transitions and less "pop-up" effect
+        depth_map = np.sqrt(depth_map)  # Square root gives more natural depth falloff
+        
+        # Add subtle depth gradients to reduce flat "cardboard" effect
+        # Create small local variations that make surfaces feel more volumetric
+        kernel = np.array([[-0.1, -0.1, -0.1],
+                          [-0.1,  1.8, -0.1], 
+                          [-0.1, -0.1, -0.1]])
+        enhanced = cv2.filter2D(depth_map, -1, kernel)
+        depth_map = np.clip(0.8 * depth_map + 0.2 * enhanced, 0.0, 1.0)
+        
+        # Light pole correction only
+        for y in range(height):
+            lat_norm = abs(y / height - 0.5) * 2
+            if lat_norm > 0.8:  # Only very close to poles
+                correction = 1.0 - (lat_norm - 0.8) * 0.2  # Much lighter correction
+                depth_map[y, :] *= correction
+        
+        # Ensure good contrast but don't over-enhance
+        depth_range = np.max(depth_map) - np.min(depth_map)
+        if depth_range < 0.4:  # Only enhance if really flat
+            depth_center = np.mean(depth_map)
+            depth_map = np.clip((depth_map - depth_center) * 1.2 + depth_center, 0.0, 1.0)
+        
+        return depth_map
+
+    def _create_gradient_depth(self, height: int, width: int) -> np.ndarray:
+        """Create a reasonable fallback depth map"""
         depth = np.zeros((height, width), dtype=np.float32)
         
         for y in range(height):
@@ -339,107 +216,89 @@ class SBS_VR_Panorama_by_SamSeen:
                 lat = (y / height - 0.5) * math.pi
                 lon = (x / width - 0.5) * 2 * math.pi
                 
-                # Create depth variation based on spherical coordinates
-                depth_val = 0.5 + 0.3 * math.cos(lat * 2) + 0.2 * math.sin(lon * 3)
+                # Create depth based on spherical coordinates with some variation
+                depth_val = 0.5 + 0.2 * math.cos(lat * 2) + 0.15 * math.sin(lon * 3)
                 depth[y, x] = np.clip(depth_val, 0.0, 1.0)
         
         return depth
 
-    def _create_stereo_displacement_optimized(self, depth_map: np.ndarray, ipd_mm: float) -> np.ndarray:
-        """Stereo displacement calculation for panoramic content"""
+    def _create_stereo_displacement(self, depth_map: np.ndarray, ipd_mm: float, depth_scale: float) -> np.ndarray:
+        """Calculate stereo displacement for panoramic content"""
         h, w = depth_map.shape
         
-        # Convert IPD to angular displacement
-        ipd_angular = (ipd_mm / 1000.0) * (w / self._two_pi) * 0.25 
+        # More conservative and predictable displacement calculation
+        base_displacement = depth_scale * 0.5
         
-        # Pre-compute latitude factors for all rows
-        lat_factors = np.cos((np.arange(h) / h - 0.5) * self._pi)
+        displacement = depth_map * base_displacement
         
-        # Vectorized displacement calculation
-        displacement = depth_map * ipd_angular
+        # Apply latitude correction
+        lat_factors = np.cos((np.arange(h) / h - 0.5) * math.pi)
+        lat_factors = 0.7 + 0.3 * lat_factors  # Range from 0.7 to 1.0
         displacement = displacement * lat_factors[:, np.newaxis]
+        
+        print(f"Displacement range: {np.min(displacement):.2f} to {np.max(displacement):.2f} pixels")
         
         return displacement
 
-    def _apply_stereo_shift_optimized(self, image: np.ndarray, displacement: np.ndarray, 
-                                   eye: str = 'left') -> np.ndarray:
-        """Memory-optimized stereo shifting with interpolation"""
+    def _apply_stereo_shift(self, image: np.ndarray, displacement: np.ndarray, eye: str = 'left') -> np.ndarray:
+        """Apply stereo shift with high-quality interpolation to preserve resolution"""
         h, w = image.shape[:2]
+        
+        # Correct stereo direction for VR
         shift_factor = -1.0 if eye == 'left' else 1.0
         
         # Create coordinate grids
         y_coords, x_coords = np.mgrid[0:h, 0:w]
         
-        # Calculate shifted coordinates
-        shifted_x = x_coords - (displacement * shift_factor).astype(np.float32)
+        # Apply shift with sub-pixel precision
+        shifted_x = (x_coords + displacement * shift_factor) % w
         
-        # Handle wraparound for panoramic coordinates
-        shifted_x = shifted_x % w
-        
-        # Use OpenCV's remap for efficient interpolation
+        # Use cubic interpolation for maximum quality
         map_x = shifted_x.astype(np.float32)
         map_y = y_coords.astype(np.float32)
         
-        shifted_image = cv2.remap(image, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_WRAP)
+        shifted_image = cv2.remap(image, map_x, map_y, cv2.INTER_CUBIC, borderMode=cv2.BORDER_WRAP)
         
         return shifted_image
 
-    def create_vr_panorama(self, panorama_image, depth_scale, blur_radius, ipd_mm, format, 
-                          invert_depth, depth_quality="high", edge_enhancement=0.0, 
-                          depth_consistency=0.3, memory_optimization=True):
-        """Create VR-compatible stereoscopic panorama"""
+    def create_vr_panorama(self, panorama_image, depth_scale, ipd_mm, format, invert_depth):
+        """Create VR-compatible stereoscopic panorama with simplified, high-quality processing"""
         
-        # Input validation
-        if blur_radius % 2 == 0:
-            blur_radius += 1
-            
         # Handle batch dimension
         if len(panorama_image.shape) == 4:
-            panorama_tensor = panorama_image[0:1]
+            panorama_tensor = panorama_image[0]
         else:
-            panorama_tensor = panorama_image.unsqueeze(0)
+            panorama_tensor = panorama_image
         
-        # Check aspect ratio
-        h, w = panorama_tensor.shape[1:3]
+        # Validate aspect ratio
+        h, w = panorama_tensor.shape[:2]
         aspect_ratio = w / h
         if not (1.8 <= aspect_ratio <= 2.2):
             print(f"Warning: Aspect ratio {aspect_ratio:.2f} is not typical for equirectangular (should be ~2:1)")
         
-        print(f"Processing {w}x{h} panorama with {depth_quality} quality, memory_opt={memory_optimization}")
+        print(f"Processing {w}x{h} panorama for VR")
         
         try:
-            # Generate depth map
-            depth_map = self._generate_panorama_depth(
-                panorama_tensor[0], blur_radius, depth_quality, memory_optimization
-            )
+            # Generate high-quality depth map
+            depth_map = self._generate_panorama_depth(panorama_tensor)
             
-            # Apply enhancements
-            depth_map = self._enhance_panoramic_depth(
-                depth_map, depth_quality, edge_enhancement, depth_consistency
-            )
-            
-            # Apply blur and depth inversion
-            if blur_radius > 1:
-                depth_map = cv2.GaussianBlur(depth_map, (blur_radius, blur_radius), 0)
-            
+            # Apply depth inversion if requested
             if invert_depth:
                 depth_map = 1.0 - depth_map
             
-            # Scale depth
-            depth_map = depth_map * (depth_scale / 100.0)
-            
-            # Convert to numpy for processing
-            panorama_np = panorama_tensor[0].cpu().numpy() * 255.0
+            # Convert panorama to numpy for processing
+            panorama_np = panorama_tensor.cpu().numpy() * 255.0
             panorama_np = panorama_np.astype(np.uint8)
             
-            # Create optimized displacement map
-            displacement = self._create_stereo_displacement_optimized(depth_map, ipd_mm)
+            # Create stereo displacement map
+            displacement = self._create_stereo_displacement(depth_map, ipd_mm, depth_scale)
             
-            # Generate stereo views
-            left_eye = self._apply_stereo_shift_optimized(panorama_np, displacement, 'left')
-            right_eye = self._apply_stereo_shift_optimized(panorama_np, displacement, 'right')
+            # Generate left and right eye views
+            print("Generating stereo views...")
+            left_eye = self._apply_stereo_shift(panorama_np, displacement, 'left')
+            right_eye = self._apply_stereo_shift(panorama_np, displacement, 'right')
             
-            # Combine into stereo format
+            # Combine into selected stereo format
             if format == "side_by_side":
                 stereo_panorama = np.concatenate([left_eye, right_eye], axis=1)
             else:  # over_under
@@ -448,18 +307,17 @@ class SBS_VR_Panorama_by_SamSeen:
             # Convert back to tensors
             stereo_tensor = torch.tensor(stereo_panorama.astype(np.float32) / 255.0).unsqueeze(0)
             
-            # Create depth visualization
+            # Create depth visualization (3-channel for ComfyUI compatibility)
             depth_vis = np.stack([depth_map, depth_map, depth_map], axis=-1)
             depth_tensor = torch.tensor(depth_vis).unsqueeze(0)
             
-            # Clean up memory
-            if memory_optimization:
-                del panorama_np, left_eye, right_eye, displacement, depth_map
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+            # Memory cleanup
+            del panorama_np, left_eye, right_eye, displacement, depth_map
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             
-            print(f"VR panorama created: {stereo_tensor.shape}")
+            print(f"VR panorama created successfully: {stereo_tensor.shape}")
             return (stereo_tensor, depth_tensor)
             
         except Exception as e:
@@ -468,13 +326,12 @@ class SBS_VR_Panorama_by_SamSeen:
             traceback.print_exc()
             
             # Return fallback result
-            h, w = panorama_tensor.shape[1:3]
             if format == "side_by_side":
-                fallback_shape = (h, w * 2, 3)
+                fallback_shape = (1, h, w * 2, 3)
             else:
-                fallback_shape = (h * 2, w, 3)
+                fallback_shape = (1, h * 2, w, 3)
             
-            fallback_stereo = torch.zeros(fallback_shape).unsqueeze(0)
-            fallback_depth = torch.zeros((h, w, 3)).unsqueeze(0)
+            fallback_stereo = torch.zeros(fallback_shape)
+            fallback_depth = torch.zeros((1, h, w, 3))
             
             return (fallback_stereo, fallback_depth)
