@@ -47,7 +47,7 @@ class SBS_VR_Panorama_by_SamSeen:
                 "invert_depth": ("BOOLEAN", {"default": False, "tooltip": "Reverses depth perception (swap foreground/background). Enable if depth appears backwards in VR."}),
                 "depth_quality": (["standard", "high", "ultra"], {"default": "high", "tooltip": "Depth processing quality. Standard=fast, High=balanced, Ultra=best quality with advanced enhancements. Ultra may be slower."}),
                 "edge_enhancement": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.1, "tooltip": "Enhances fine depth details using unsharp masking. 0=off, 0.2-0.4=recommended, 1.0=maximum enhancement. Higher values may introduce artifacts."}),
-                "depth_consistency": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.1, "tooltip": "Temporal consistency for depth maps. Higher values create smoother depth transitions across the panorama."}),
+                "depth_consistency": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.1, "tooltip": "Spatial consistency for panoramic depth. 0=off, 0.3=balanced, 1.0=maximum smoothing. Ensures seamless 360° wrapping and smooth depth transitions. Higher values create more uniform depth flow."}),
                 "memory_optimization": ("BOOLEAN", {"default": True, "tooltip": "Enable memory optimization for large panoramas. Recommended for 4K+ images."}),
             }
         }
@@ -168,42 +168,77 @@ class SBS_VR_Panorama_by_SamSeen:
                                 edge_enhancement: float = 0.0, consistency: float = 0.3) -> np.ndarray:
         """Enhanced depth processing specifically optimized for panoramic content"""
         
-        if quality_level == "standard":
-            return depth_map
-            
         enhanced_depth = depth_map.copy()
         h, w = enhanced_depth.shape
         
-        # 1. Panoramic pole correction - reduce distortion at top/bottom
+        # Apply depth consistency processing with careful intensity control
+        if consistency > 0.0:
+            # Circular continuity enforcement for 360° wrapping (horizontal)
+            # Only blend at the edges - don't affect the rest of the image
+            edge_width = min(w // 30, 32)  # Smaller edge width to reduce impact
+            if edge_width > 0:
+                left_edge = enhanced_depth[:, :edge_width]
+                right_edge = enhanced_depth[:, -edge_width:]
+                
+                # Blend edges for seamless wrapping with reduced intensity
+                for i in range(edge_width):
+                    # Reduce the consistency effect to preserve original depth quality
+                    weight = (i + 1) / edge_width * consistency * 0.5  # Reduced from full consistency
+                    blended_left = (1 - weight) * left_edge[:, i] + weight * right_edge[:, -(i+1)]
+                    blended_right = (1 - weight) * right_edge[:, -(i+1)] + weight * left_edge[:, i]
+                    
+                    enhanced_depth[:, i] = blended_left
+                    enhanced_depth[:, -(i+1)] = blended_right
+            
+            # Add gentle vertical smoothing for higher consistency values
+            if consistency > 0.5:  # Increase threshold to make it less aggressive
+                kernel_size = max(3, int(3 * consistency))  # Smaller kernel sizes
+                if kernel_size % 2 == 0:
+                    kernel_size += 1
+                
+                # Apply very light vertical blur
+                smoothed_vertical = cv2.GaussianBlur(enhanced_depth, (1, kernel_size), 0)
+                # Blend with original with much lower intensity
+                blend_factor = consistency * 0.2  # Much lower blend factor
+                enhanced_depth = (1 - blend_factor) * enhanced_depth + blend_factor * smoothed_vertical
+            
+            # Add subtle radial consistency for higher consistency values
+            if consistency > 0.7: 
+                # Create radial weight map
+                center_y, center_x = h // 2, w // 2
+                y_coords, x_coords = np.ogrid[:h, :w]
+                
+                # Calculate distance from center (normalized)
+                distances = np.sqrt(((y_coords - center_y) / h)**2 + ((x_coords - center_x) / w)**2)
+                distances = distances / np.max(distances)  # Normalize to 0-1
+                
+                # Apply very subtle radial adjustment
+                radial_adjustment = 1.0 - (distances * (consistency - 0.7) * 0.1) 
+                radial_adjustment = np.clip(radial_adjustment, 0.9, 1.1)  # Limit the adjustment range
+                
+                # Apply subtle radial consistency
+                enhanced_depth *= radial_adjustment
+        
+        # Early return for standard quality 
+        if quality_level == "standard":
+            # Ensure depth values are still in valid range
+            enhanced_depth = np.clip(enhanced_depth, 0.0, 1.0)
+            return enhanced_depth
+        
+        # Panoramic pole correction - reduce distortion at top/bottom
         if quality_level in ["high", "ultra"]:
-            pole_correction_strength = 0.3
+            pole_correction_strength = 0.2  
             for y in range(h):
                 # Calculate distance from equator (0.5)
                 lat_norm = abs(y / h - 0.5) * 2  # 0 at equator, 1 at poles
-                if lat_norm > 0.7:  # Only correct near poles
-                    correction_factor = 1.0 - (lat_norm - 0.7) * pole_correction_strength
+                if lat_norm > 0.8:  # Only correct very close to poles
+                    correction_factor = 1.0 - (lat_norm - 0.8) * pole_correction_strength
                     enhanced_depth[y, :] *= correction_factor
         
-        # 2. Circular continuity enforcement for 360° wrapping
-        if consistency > 0.0:
-            # Ensure left and right edges match (360° continuity)
-            edge_width = min(w // 20, 50)  # Use up to 50 pixels or 5% of width
-            left_edge = enhanced_depth[:, :edge_width]
-            right_edge = enhanced_depth[:, -edge_width:]
-            
-            # Blend edges for seamless wrapping
-            for i in range(edge_width):
-                weight = (i + 1) / edge_width * consistency
-                blended_left = (1 - weight) * left_edge[:, i] + weight * right_edge[:, -(i+1)]
-                blended_right = (1 - weight) * right_edge[:, -(i+1)] + weight * left_edge[:, i]
-                
-                enhanced_depth[:, i] = blended_left
-                enhanced_depth[:, -(i+1)] = blended_right
-        
-        # 3. Edge enhancement with panoramic awareness
+        # Edge enhancement with panoramic awareness
         if edge_enhancement > 0.0:
             # Use adaptive kernel size based on image resolution
-            kernel_size = max(3, min(15, w // 512))
+            kernel_size = max(3, min(11, w // 512))  
             if kernel_size % 2 == 0:
                 kernel_size += 1
             
@@ -215,18 +250,16 @@ class SBS_VR_Panorama_by_SamSeen:
             lat_weights = np.zeros(h)
             for y in range(h):
                 lat_norm = abs(y / h - 0.5) * 2
-                lat_weights[y] = 1.0 - lat_norm * 0.5  # Reduce enhancement at poles
+                lat_weights[y] = 1.0 - lat_norm * 0.3 
             
             for y in range(h):
                 enhanced_depth[y, :] += edge_mask[y, :] * edge_enhancement * lat_weights[y]
             
             enhanced_depth = np.clip(enhanced_depth, 0.0, 1.0)
         
-        # 4. Ultra quality: Multi-scale refinement
         if quality_level == "ultra":
-            # Process at multiple scales and combine
-            scales = [1.0, 0.5, 0.25]
-            scale_weights = [0.6, 0.3, 0.1]
+            scales = [1.0, 0.5]  
+            scale_weights = [0.8, 0.2]  
             refined_depth = np.zeros_like(enhanced_depth)
             
             for scale, weight in zip(scales, scale_weights):
@@ -236,9 +269,9 @@ class SBS_VR_Panorama_by_SamSeen:
                     scale_w, scale_h = int(w * scale), int(h * scale)
                     scale_depth = cv2.resize(enhanced_depth, (scale_w, scale_h), interpolation=cv2.INTER_AREA)
                     
-                    # Apply bilateral filter at this scale
+                    # Apply gentler bilateral filter
                     scale_depth_8bit = (scale_depth * 255).astype(np.uint8)
-                    filtered = cv2.bilateralFilter(scale_depth_8bit, 9, 75, 75)
+                    filtered = cv2.bilateralFilter(scale_depth_8bit, 5, 50, 50)  
                     scale_depth = filtered.astype(np.float32) / 255.0
                     
                     # Resize back to original size
@@ -248,9 +281,9 @@ class SBS_VR_Panorama_by_SamSeen:
             
             enhanced_depth = refined_depth
         
-        # 5. Final normalization and contrast enhancement
         mean_depth = np.mean(enhanced_depth)
-        enhanced_depth = np.clip((enhanced_depth - mean_depth) * 1.1 + mean_depth, 0.0, 1.0)
+        contrast_factor = 1.05  # Reduced from 1.1 to preserve detail
+        enhanced_depth = np.clip((enhanced_depth - mean_depth) * contrast_factor + mean_depth, 0.0, 1.0)
         
         print(f"Depth enhancement complete: quality={quality_level}, edge={edge_enhancement}, consistency={consistency}")
         
@@ -313,11 +346,11 @@ class SBS_VR_Panorama_by_SamSeen:
         return depth
 
     def _create_stereo_displacement_optimized(self, depth_map: np.ndarray, ipd_mm: float) -> np.ndarray:
-        """Optimized stereo displacement calculation for panoramic content"""
+        """Stereo displacement calculation for panoramic content"""
         h, w = depth_map.shape
         
-        # Convert IPD to angular displacement (optimized for VR viewing)
-        ipd_angular = (ipd_mm / 1000.0) * (w / self._two_pi) * 0.25  # Reduced for comfort
+        # Convert IPD to angular displacement
+        ipd_angular = (ipd_mm / 1000.0) * (w / self._two_pi) * 0.25 
         
         # Pre-compute latitude factors for all rows
         lat_factors = np.cos((np.arange(h) / h - 0.5) * self._pi)
@@ -330,7 +363,7 @@ class SBS_VR_Panorama_by_SamSeen:
 
     def _apply_stereo_shift_optimized(self, image: np.ndarray, displacement: np.ndarray, 
                                    eye: str = 'left') -> np.ndarray:
-        """Memory-optimized stereo shifting with improved interpolation"""
+        """Memory-optimized stereo shifting with interpolation"""
         h, w = image.shape[:2]
         shift_factor = -1.0 if eye == 'left' else 1.0
         
@@ -354,7 +387,7 @@ class SBS_VR_Panorama_by_SamSeen:
     def create_vr_panorama(self, panorama_image, depth_scale, blur_radius, ipd_mm, format, 
                           invert_depth, depth_quality="high", edge_enhancement=0.0, 
                           depth_consistency=0.3, memory_optimization=True):
-        """Create VR-compatible stereoscopic panorama with optimizations"""
+        """Create VR-compatible stereoscopic panorama"""
         
         # Input validation
         if blur_radius % 2 == 0:
@@ -403,7 +436,6 @@ class SBS_VR_Panorama_by_SamSeen:
             displacement = self._create_stereo_displacement_optimized(depth_map, ipd_mm)
             
             # Generate stereo views
-            print("Generating stereo views with optimized processing...")
             left_eye = self._apply_stereo_shift_optimized(panorama_np, displacement, 'left')
             right_eye = self._apply_stereo_shift_optimized(panorama_np, displacement, 'right')
             
